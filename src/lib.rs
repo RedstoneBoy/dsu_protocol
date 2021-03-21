@@ -1,824 +1,990 @@
-use core::convert::TryInto;
-
 pub mod error;
+pub mod types;
+
+use core::convert::TryInto;
+use core::hash::Hasher;
 
 use error::*;
+use types::*;
+
+pub const MAGIC_CLIENT: u32 = 0x43555344;
+pub const MAGIC_SERVER: u32 = 0x53555344;
 
 pub const MESSAGE_PROTOCOL: u32 = 0x100000;
 pub const MESSAGE_INFO: u32 = 0x100001;
 pub const MESSAGE_DATA: u32 = 0x100002;
 
-pub const PROTOCOL_VERSION_1001: u16 = 1001;
-
-pub const MAGIC_CLIENT: [u8; 4] = [b'D', b'S', b'U', b'C'];
-pub const MAGIC_SERVER: [u8; 4] = [b'D', b'S', b'U', b'S'];
-
-pub const BUFFER_SIZE: usize = 100;
-
-const CRC_POSITION: usize = 8;
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Magic {
-    /// Used when the server is sending the message
-    Server,
-    /// Used when the client is sending the message
-    Client,
+pub trait Access<'a, const SIZE: usize> {
+    type Buffer;
+    type SizedBuffer;
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ProtocolVersion {
-    Version1001,
+pub struct Ref;
+impl<'a, const SIZE: usize> Access<'a, SIZE> for Ref {
+    type Buffer = &'a [u8];
+    type SizedBuffer = &'a [u8; SIZE];
 }
 
-impl ProtocolVersion {
-    const LENGTH: usize = 2;
-
-    fn serialize(&self) -> [u8; Self::LENGTH] {
-        match self {
-            ProtocolVersion::Version1001 => PROTOCOL_VERSION_1001.to_le_bytes(),
-        }
-    }
-
-    fn deserialize(data: &[u8; Self::LENGTH]) -> Result<Self, u16> {
-        let version = u16::from_le_bytes(*data);
-        match version {
-            PROTOCOL_VERSION_1001 => Ok(Self::Version1001),
-            _ => Err(version),
-        }
-    }
+pub struct Mut;
+impl<'a, const SIZE: usize> Access<'a, SIZE> for Mut {
+    type Buffer = &'a mut [u8];
+    type SizedBuffer = &'a mut [u8; SIZE];
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum MessageType {
-    ProtocolVersionInfo,
-    ControllerInfo,
-    ControllerData,
+pub struct Owned;
+impl<'a, const SIZE: usize> Access<'a, SIZE> for Owned {
+    type Buffer = [u8; SIZE];
+    type SizedBuffer = [u8; SIZE];
 }
 
-#[derive(Clone, Debug)]
-pub struct MessageHeader {
-    pub magic: Magic,
-    pub protocol_version: ProtocolVersion,
-    /// Length of packet without header
-    /// Note: message_type is not actually part of the header
-    pub length: u16,
-    /// CRC32 Hash of entire packet while crc was zeroed
-    pub crc32_hash: u32,
-    /// ID of client or server who sent this packet
-    pub sender_id: u32,
-    /// Note: this is not actually part of the header
-    pub message_type: MessageType,
-}
+macro_rules! buf_type {
+    (message $name:ident, $size:literal) => {
+        buf_type!($name, $size);
 
-impl MessageHeader {
-    pub const LENGTH: usize = 20;
-
-    pub fn serialize(&self) -> [u8; Self::LENGTH] {
-        let mut data = [0; Self::LENGTH];
-        self.serialize_to(&mut data);
-        data
-    }
-
-    pub fn serialize_to(&self, data: &mut [u8; Self::LENGTH]) {
-        match self.magic {
-            Magic::Client => data[0..4].copy_from_slice(&MAGIC_CLIENT),
-            Magic::Server => data[0..4].copy_from_slice(&MAGIC_SERVER),
-        }
-
-        data[4..6].copy_from_slice(&self.protocol_version.serialize());
-
-        data[6..8].copy_from_slice(&self.length.to_le_bytes());
-        data[8..12].copy_from_slice(&self.crc32_hash.to_le_bytes());
-        data[12..16].copy_from_slice(&self.sender_id.to_le_bytes());
-
-        match self.message_type {
-            MessageType::ProtocolVersionInfo => {
-                data[16..20].copy_from_slice(&MESSAGE_PROTOCOL.to_le_bytes())
-            }
-            MessageType::ControllerInfo => {
-                data[16..20].copy_from_slice(&MESSAGE_INFO.to_le_bytes())
-            }
-            MessageType::ControllerData => {
-                data[16..20].copy_from_slice(&MESSAGE_DATA.to_le_bytes())
+        impl<'a> $name<'a, Mut> {
+            pub fn update_crc<H: Hasher>(&mut self, mut hasher: H) {
+                hasher.write(&self.buf[0..8]);
+                hasher.write(&[0u8; 4]);
+                hasher.write(&self.buf[12..]);
+                self.header_mut().set_crc32(hasher.finish() as u32);
             }
         }
+
+        impl<'a> $name<'a, Owned> {
+            fn new_uninit() -> Self {
+                Self { buf: [0; $size] }
+            }
+
+            pub fn get(&self) -> $name<Ref> {
+                $name::<Ref>::from_ref(&self.buf)
+            }
+
+            pub fn get_mut(&mut self) -> $name<Mut> {
+                $name::<Mut>::from_mut(&mut self.buf)
+            }
+        }
+    };
+    ($name:ident, $size:literal) => {
+        pub struct $name<'a, A: Access<'a, $size> = Owned> {
+            buf: A::SizedBuffer,
+        }
+
+        impl<'a> $name<'a, Ref> {
+            pub fn bytes(&self) -> &[u8] {
+                self.buf
+            }
+
+            pub fn from_ref(buf: &'a [u8; $size]) -> Self {
+                Self { buf }
+            }
+        }
+
+        impl<'a> $name<'a, Mut> {
+            pub fn bytes(&self) -> &[u8] {
+                self.buf
+            }
+
+            pub fn bytes_mut(&mut self) -> &mut [u8] {
+                self.buf
+            }
+
+            pub fn from_mut(buf: &'a mut [u8; $size]) -> Self {
+                Self { buf }
+            }
+        }
+
+        impl<'a> $name<'a, Owned> {
+            pub fn bytes(&self) -> &[u8] {
+                &self.buf
+            }
+
+            pub fn bytes_mut(&mut self) -> &mut [u8] {
+                &mut self.buf
+            }
+        }
+    };
+    (dynamic message $name:ident, $size:literal) => {
+        pub struct $name<'a, A: Access<'a, $size> = Owned> {
+            buf: A::Buffer,
+        }
+
+        impl<'a> $name<'a, Owned> {
+            fn new_uninit() -> Self {
+                Self { buf: [0; $size] }
+            }
+
+            pub fn get(&self) -> $name<Ref> {
+                $name::<Ref>::from_ref(&self.buf)
+            }
+
+            pub fn get_mut(&mut self) -> $name<Mut> {
+                $name::<Mut>::from_mut(&mut self.buf)
+            }
+        }
+    };
+}
+
+macro_rules! impl_new {
+    ($name:ident, $($field:ident : $fieldty:ty),* $(,)?) => {
+        impl<'a> $name<'a, Owned> {
+            pub fn new<H: Hasher>(
+                $($field: $fieldty,)*
+                hasher: H
+            ) -> Self {
+                let mut this = Self::new_uninit();
+                this.get_mut().initialize(
+                    $($field,)*
+                    hasher,
+                );
+                this
+            }
+        }
+    };
+}
+
+macro_rules! int_fields {
+    ($name:ident, $($field:ident $set_field:ident : $itype:ty = $range:expr),* $(,)?) => {
+        impl<'a> $name<'a, Ref> {
+            $(
+                pub fn $field(&self) -> $itype {
+                    <$itype>::from_le_bytes(self.buf[$range].try_into().unwrap())
+                }
+            )*
+        }
+
+        impl<'a> $name<'a, Mut> {
+            $(
+                pub fn $field(&self) -> $itype {
+                    <$itype>::from_le_bytes(self.buf[$range].try_into().unwrap())
+                }
+
+                pub fn $set_field(&mut self, val: $itype) {
+                    self.buf[$range].copy_from_slice(&val.to_le_bytes());
+                }
+            )*
+        }
+    };
+}
+
+macro_rules! enum_fields {
+    ($name:ident, $($field:ident $set_field:ident from $valtype:ty [ $range:expr ] $enumtype:ty = $field_name:literal {
+        $($enumraw:expr => $enumval:path,)* $(,)?
+    })*) => {
+        impl<'a> $name<'a, Ref> {
+            $(
+                pub fn $field(&self) -> Result<$enumtype, Invalid<$valtype>> {
+                    match <$valtype>::from_le_bytes(self.buf[$range].try_into().unwrap()) {
+                        $(val if val == $enumraw => Ok($enumval),)*
+                        invalid => Err(Invalid(invalid, $field_name)),
+                    }
+                }
+            )*
+        }
+
+        impl<'a> $name<'a, Mut> {
+            $(
+                pub fn $field(&self) -> Result<$enumtype, Invalid<$valtype>> {
+                    match <$valtype>::from_le_bytes(self.buf[$range].try_into().unwrap()) {
+                        $(val if val == $enumraw => Ok($enumval),)*
+                        invalid => Err(Invalid(invalid, $field_name)),
+                    }
+                }
+
+                pub fn $set_field(&mut self, val: $enumtype) {
+                    let intval: $valtype = match val {
+                        $($enumval => $enumraw,)*
+                    };
+                    self.buf[$range].copy_from_slice(&intval.to_le_bytes());
+                }
+            )*
+        }
+    };
+}
+
+macro_rules! sub_fields {
+    ($name:ident, $($field:ident $field_mut:ident : $ftype:ident = $range:expr),* $(,)?) => {
+        impl<'a> $name<'a, Ref> {
+            $(
+                pub fn $field(&self) -> $ftype<Ref> {
+                    $ftype::<Ref>::from_ref(self.buf[$range].try_into().unwrap())
+                }
+            )*
+        }
+
+        impl<'a> $name<'a, Mut> {
+            $(
+                pub fn $field(&self) -> $ftype<Ref> {
+                    $ftype::<Ref>::from_ref(self.buf[$range].try_into().unwrap())
+                }
+
+                pub fn $field_mut(&mut self) -> $ftype<Mut> {
+                    $ftype::from_mut((&mut self.buf[$range]).try_into().unwrap())
+                }
+            )*
+        }
+    };
+}
+
+/*
+pub struct Message<'a, A: Access<'a, 0>> {
+    header: Header<'a, A>,
+    body: Body<'a, A>,
+}
+
+impl<'a> Message<'a, Ref> {
+    pub fn new(data: &'a [u8]) -> Self {
+        todo!()
     }
+}
+*/
 
-    pub fn deserialize(data: &[u8; Self::LENGTH]) -> Result<Self, HeaderError> {
-        let magic = match &data[0..4] {
-            magic if magic == &MAGIC_CLIENT => Magic::Client,
-            magic if magic == &MAGIC_SERVER => Magic::Server,
-            magic => return Err(HeaderError::InvalidMagic(magic.try_into().unwrap())),
-        };
+buf_type!(Header, 20);
 
-        let protocol_version = ProtocolVersion::deserialize(&data[4..6].try_into().unwrap())
-            .map_err(HeaderError::UnsupportedProtocolVersion)?;
+int_fields!(Header,
+    packet_length set_packet_length: u16 = 6..8,
+    crc32         set_crc32:         u32 = 8..12,
+    sender_id     set_sender_id:     u32 = 12..16,
+);
 
-        let length = u16::from_le_bytes(data[6..8].try_into().unwrap());
-        let crc32_hash = u32::from_le_bytes(data[8..12].try_into().unwrap());
-        let sender_id = u32::from_le_bytes(data[12..16].try_into().unwrap());
+enum_fields!(Header,
+    magic set_magic from u32[0..4] Magic = "magic" {
+        MAGIC_CLIENT => Magic::Client,
+        MAGIC_SERVER => Magic::Server,
+    }
+    message_type set_message_type from u32[16..20] MessageType = "message_type" {
+        MESSAGE_PROTOCOL => MessageType::ProtocolVersionInfo,
+        MESSAGE_INFO     => MessageType::ControllerInfo,
+        MESSAGE_DATA     => MessageType::ControllerData,
+    }
+    protocol set_protocol from u16[4..6] Protocol = "protocol" {
+        1001 => Protocol::Version1001,
+    }
+);
 
-        let message_type = match u32::from_le_bytes(data[16..20].try_into().unwrap()) {
-            MESSAGE_PROTOCOL => MessageType::ProtocolVersionInfo,
-            MESSAGE_INFO => MessageType::ControllerInfo,
-            MESSAGE_DATA => MessageType::ControllerData,
-            message_type => return Err(HeaderError::InvalidMessageType(message_type)),
-        };
+impl<'a> Header<'a, Mut> {
+    pub fn initialize(
+        &mut self,
+        magic: Magic,
+        protocol: Protocol,
+        length: u16,
+        crc32: u32,
+        sender_id: u32,
+        message_type: MessageType,
+    ) {
+        self.set_magic(magic);
+        self.set_protocol(protocol);
+        self.set_packet_length(length);
+        self.set_crc32(crc32);
+        self.set_sender_id(sender_id);
+        self.set_message_type(message_type);
+    }
+}
 
-        Ok(MessageHeader {
-            magic,
-            protocol_version,
-            length,
-            crc32_hash,
+buf_type!(message RequestProtocolVersionInfo, 20);
+
+sub_fields!(RequestProtocolVersionInfo,
+    header header_mut: Header = 0..20,
+);
+
+impl<'a> RequestProtocolVersionInfo<'a, Mut> {
+    pub fn initialize<H: Hasher>(&mut self, sender_id: u32, hasher: H) {
+        self.header_mut().initialize(
+            Magic::Client,
+            Protocol::Version1001,
+            20 - 16,
+            0,
             sender_id,
-            message_type,
-        })
+            MessageType::ProtocolVersionInfo,
+        );
+        self.update_crc(hasher);
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct RequestProtocolInfoMessage;
+impl_new!(RequestProtocolVersionInfo, sender_id: u32,);
 
-impl RequestProtocolInfoMessage {
-    const LENGTH: usize = 0;
-}
+buf_type!(message ProtocolVersionInfo, 22);
 
-#[derive(Clone, Debug)]
-pub struct ProtocolInfoMessage {
-    /// Maximum protocol version supported by your application
-    pub protocol: ProtocolVersion,
-}
+sub_fields!(ProtocolVersionInfo,
+    header header_mut: Header = 0..20,
+);
 
-impl ProtocolInfoMessage {
-    pub const LENGTH: usize = 2;
-
-    pub fn serialize(&self) -> [u8; Self::LENGTH] {
-        let mut data = [0; Self::LENGTH];
-        self.serialize_to(&mut data);
-        data
+enum_fields!(ProtocolVersionInfo,
+    protocol set_protocol from u16[(20 + 0)..2] Protocol = "protocol" {
+        1001 => Protocol::Version1001,
     }
+);
 
-    pub fn serialize_to(&self, data: &mut [u8; Self::LENGTH]) {
-        data.copy_from_slice(&self.protocol.serialize());
-    }
-
-    pub fn deserialize(data: &[u8; Self::LENGTH]) -> Result<Self, UnsupportedProtocolVersion> {
-        ProtocolVersion::deserialize(data)
-            .map(|protocol| ProtocolInfoMessage { protocol })
-            .map_err(UnsupportedProtocolVersion)
+impl<'a> ProtocolVersionInfo<'a, Mut> {
+    pub fn initialize<H: Hasher>(&mut self, sender_id: u32, protocol: Protocol, hasher: H) {
+        self.header_mut().initialize(
+            Magic::Server,
+            protocol,
+            22 - 16,
+            0,
+            sender_id,
+            MessageType::ProtocolVersionInfo,
+        );
+        self.set_protocol(protocol);
+        self.update_crc(hasher);
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SlotState {
-    Disconnected,
-    Reserved,
-    Connected,
+impl_new!(ProtocolVersionInfo, sender_id: u32, protocol: Protocol,);
+
+buf_type!(ControllerHeader, 11);
+
+int_fields!(ControllerHeader,
+    slot set_slot: u8 = 0..1,
+);
+
+enum_fields!(ControllerHeader,
+    state set_state from u8[1..2] State = "state" {
+        0 => State::Disconnected,
+        1 => State::Reserved,
+        2 => State::Connected,
+    }
+    model set_model from u8[2..3] Model = "model" {
+        0 => Model::NotApplicable,
+        1 => Model::PartialGyro,
+        2 => Model::FullGyro,
+        3 => Model::Unused,
+    }
+    connection_type set_connection_type from u8[3..4] ConnectionType = "connection_type" {
+        0 => ConnectionType::NotApplicable,
+        1 => ConnectionType::Usb,
+        2 => ConnectionType::Bluetooth,
+    }
+    battery_status set_battery_status from u8[10..11] BatteryStatus = "battery_status" {
+        0x00 => BatteryStatus::NotApplicable,
+        0x01 => BatteryStatus::Dying,
+        0x02 => BatteryStatus::Low,
+        0x03 => BatteryStatus::Medium,
+        0x04 => BatteryStatus::High,
+        0x05 => BatteryStatus::Full,
+        0xEE => BatteryStatus::Charging,
+        0xEF => BatteryStatus::Charged,
+    }
+);
+
+impl<'a> ControllerHeader<'a, Ref> {
+    pub fn mac(&self) -> &[u8; 6] {
+        self.buf[4..10].try_into().unwrap()
+    }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Model {
-    NotApplicable,
-    PartialGyro,
-    FullGyro,
-    Unused,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ConnectionType {
-    NotApplicable,
-    Usb,
-    Bluetooth,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BatteryStatus {
-    NotApplicable,
-    Dying,
-    Low,
-    Medium,
-    High,
-    Full,
-    Charging,
-    Charged,
-}
-
-#[derive(Clone, Debug)]
-pub struct ControllerInfo {
-    pub slot: u8,
-    pub slot_state: SlotState,
-    pub model: Model,
-    pub connection_type: ConnectionType,
-    pub mac: [u8; 6],
-    pub battery_status: BatteryStatus,
-}
-
-impl ControllerInfo {
-    const LENGTH: usize = 11;
-
-    fn serialize_to(&self, data: &mut [u8; Self::LENGTH]) {
-        data[0] = self.slot;
-        data[1] = match self.slot_state {
-            SlotState::Disconnected => 0,
-            SlotState::Reserved => 1,
-            SlotState::Connected => 2,
-        };
-        data[2] = match self.model {
-            Model::NotApplicable => 0,
-            Model::PartialGyro => 1,
-            Model::FullGyro => 2,
-            Model::Unused => 3,
-        };
-        data[3] = match self.connection_type {
-            ConnectionType::NotApplicable => 0,
-            ConnectionType::Usb => 1,
-            ConnectionType::Bluetooth => 2,
-        };
-        data[4..10].copy_from_slice(&self.mac);
-        data[10] = match self.battery_status {
-            BatteryStatus::NotApplicable => 0x00,
-            BatteryStatus::Dying => 0x01,
-            BatteryStatus::Low => 0x02,
-            BatteryStatus::Medium => 0x03,
-            BatteryStatus::High => 0x04,
-            BatteryStatus::Full => 0x05,
-            BatteryStatus::Charging => 0xEE,
-            BatteryStatus::Charged => 0xEF,
-        };
+impl<'a> ControllerHeader<'a, Mut> {
+    pub fn initialize(
+        &mut self,
+        slot: u8,
+        state: State,
+        model: Model,
+        connection_type: ConnectionType,
+        mac: [u8; 6],
+        battery_status: BatteryStatus,
+    ) {
+        self.set_slot(slot);
+        self.set_state(state);
+        self.set_model(model);
+        self.set_connection_type(connection_type);
+        *self.mac_mut() = mac;
+        self.set_battery_status(battery_status);
     }
 
-    fn deserialize(data: &[u8; Self::LENGTH]) -> Result<Self, ControllerInfoError> {
-        let slot = data[0];
-        let slot_state = match data[1] {
-            0 => SlotState::Disconnected,
-            1 => SlotState::Reserved,
-            2 => SlotState::Connected,
-            slot_state => return Err(ControllerInfoError::InvalidSlotState(slot_state)),
-        };
-        let model = match data[2] {
-            0 => Model::NotApplicable,
-            1 => Model::PartialGyro,
-            2 => Model::FullGyro,
-            3 => Model::Unused,
-            model => return Err(ControllerInfoError::InvalidModel(model)),
-        };
-        let connection_type = match data[3] {
-            0 => ConnectionType::NotApplicable,
-            1 => ConnectionType::Usb,
-            2 => ConnectionType::Bluetooth,
-            conn_type => return Err(ControllerInfoError::InvalidConnectionType(conn_type)),
-        };
-        let mac = data[4..10].try_into().unwrap();
-        let battery_status = match data[10] {
-            0x00 => BatteryStatus::NotApplicable,
-            0x01 => BatteryStatus::Dying,
-            0x02 => BatteryStatus::Low,
-            0x03 => BatteryStatus::Medium,
-            0x04 => BatteryStatus::High,
-            0x05 => BatteryStatus::Full,
-            0xEE => BatteryStatus::Charging,
-            0xEF => BatteryStatus::Charged,
-            bat => return Err(ControllerInfoError::InvalidBatteryStatus(bat)),
-        };
+    pub fn mac(&self) -> &[u8; 6] {
+        self.buf[4..10].try_into().unwrap()
+    }
 
-        Ok(Self {
+    pub fn mac_mut(&mut self) -> &mut [u8; 6] {
+        (&mut self.buf[4..10]).try_into().unwrap()
+    }
+}
+
+buf_type!(dynamic message RequestControllerInfo, 28);
+
+sub_fields!(RequestControllerInfo,
+    header header_mut: Header = 0..20,
+);
+
+impl<'a> RequestControllerInfo<'a, Ref> {
+    pub fn from_ref(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
+    pub fn slots(&self) -> Result<&[u8], RequestControllerInfoError> {
+        let port = self.num_slots()? as usize;
+        if self.buf.len() < 20 + 4 + port {
+            return Err(RequestControllerInfoError::SliceTooSmall);
+        }
+        Ok(&self.buf[24..][..port])
+    }
+
+    pub fn num_slots(&self) -> Result<usize, RequestControllerInfoError> {
+        if self.buf.len() < 20 + 4 {
+            return Err(RequestControllerInfoError::SliceTooSmall);
+        }
+        let port = i32::from_le_bytes(self.buf[20..24].try_into().unwrap());
+        if port < 0 || 4 < port {
+            return Err(RequestControllerInfoError::InvalidSlotsLength(port));
+        }
+        Ok(port as usize)
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf[..28]
+    }
+}
+
+impl<'a> RequestControllerInfo<'a, Mut> {
+    pub fn from_mut(buf: &'a mut [u8]) -> Self {
+        Self { buf }
+    }
+
+    pub fn initialize<H: Hasher>(
+        &mut self,
+        sender_id: u32,
+        slots: &[u8],
+        hasher: H,
+    ) -> Result<(), RequestControllerInfoError> {
+        let len = self.num_slots()? as u16;
+        self.header_mut().initialize(
+            Magic::Client,
+            Protocol::Version1001,
+            24 + len - 16,
+            0,
+            sender_id,
+            MessageType::ProtocolVersionInfo,
+        );
+        self.set_slots(slots)?;
+        self.update_crc(hasher)?;
+        Ok(())
+    }
+
+    pub fn update_crc<H: Hasher>(
+        &mut self,
+        mut hasher: H,
+    ) -> Result<(), RequestControllerInfoError> {
+        let len = self.num_slots()?;
+        hasher.write(&self.buf[0..8]);
+        hasher.write(&[0u8; 4]);
+        hasher.write(&self.buf[12..(24 + len)]);
+        self.header_mut().set_crc32(hasher.finish() as u32);
+        Ok(())
+    }
+
+    pub fn slots(&self) -> Result<&[u8], RequestControllerInfoError> {
+        let port = self.num_slots()? as usize;
+        if self.buf.len() < 20 + 4 + port {
+            return Err(RequestControllerInfoError::SliceTooSmall);
+        }
+        Ok(&self.buf[24..][..port])
+    }
+
+    pub fn set_slots(&mut self, slots: &[u8]) -> Result<(), RequestControllerInfoError> {
+        if slots.len() < 1 || 4 < slots.len() {
+            return Err(RequestControllerInfoError::InvalidSlotsLength(
+                slots.len() as u32 as i32,
+            ));
+        }
+        if self.buf.len() < 20 + 4 + slots.len() {
+            return Err(RequestControllerInfoError::SliceTooSmall);
+        }
+        self.buf[20..24].copy_from_slice(&(slots.len() as i32).to_le_bytes());
+        self.buf[24..][..slots.len()].copy_from_slice(slots);
+        Ok(())
+    }
+
+    pub fn num_slots(&self) -> Result<usize, RequestControllerInfoError> {
+        if self.buf.len() < 20 + 4 {
+            return Err(RequestControllerInfoError::SliceTooSmall);
+        }
+        let port = i32::from_le_bytes(self.buf[20..24].try_into().unwrap());
+        if port < 0 || 4 < port {
+            return Err(RequestControllerInfoError::InvalidSlotsLength(port));
+        }
+        Ok(port as usize)
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf[..28]
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[..28]
+    }
+}
+
+impl<'a> RequestControllerInfo<'a, Owned> {
+    pub fn new_owned<H: Hasher>(
+        sender_id: u32,
+        slots: &[u8],
+        hasher: H,
+    ) -> Result<Self, RequestControllerInfoError> {
+        let mut this = Self::new_uninit();
+        this.get_mut().initialize(sender_id, slots, hasher)?;
+        Ok(this)
+    }
+}
+
+buf_type!(message ControllerInfo, 32);
+
+sub_fields!(ControllerInfo,
+    header header_mut: Header = 0..20,
+    controller_header controller_header_mut: ControllerHeader = 20..31,
+);
+
+impl<'a> ControllerInfo<'a, Mut> {
+    pub fn initialize<H: Hasher>(
+        &mut self,
+        sender_id: u32,
+        slot: u8,
+        state: State,
+        model: Model,
+        connection_type: ConnectionType,
+        mac: [u8; 6],
+        battery_status: BatteryStatus,
+        hasher: H,
+    ) {
+        self.header_mut().initialize(
+            Magic::Server,
+            Protocol::Version1001,
+            32 - 16,
+            0,
+            sender_id,
+            MessageType::ControllerInfo,
+        );
+        self.controller_header_mut().initialize(
             slot,
-            slot_state,
+            state,
             model,
             connection_type,
             mac,
             battery_status,
-        })
+        );
+        self.update_crc(hasher);
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct RequestControllerInfoMessage {
-    // invariant: 1 <= ports <= 4
-    ports: usize,
-    slots: [u8; 4],
-}
+impl_new!(
+    ControllerInfo,
+    sender_id: u32,
+    slot: u8,
+    state: State,
+    model: Model,
+    connection_type: ConnectionType,
+    mac: [u8; 6],
+    battery_status: BatteryStatus,
+);
 
-impl RequestControllerInfoMessage {
-    pub fn new1(slots: [u8; 1]) -> Self {
-        Self {
-            ports: 1,
-            slots: [slots[0], 0, 0, 0],
-        }
+buf_type!(message RequestControllerData, 28);
+
+sub_fields!(RequestControllerData,
+    header header_mut: Header = 0..20,
+);
+
+int_fields!(RequestControllerData,
+    slot set_slot: u8 = 21..22,
+);
+
+enum_fields!(RequestControllerData,
+    registration set_registration from u8[20..21] Registration = "registration" {
+        0 => Registration::AllControllers,
+        1 => Registration::SlotBased,
+        2 => Registration::MacBased,
     }
+);
 
-    pub fn new2(slots: [u8; 2]) -> Self {
-        Self {
-            ports: 2,
-            slots: [slots[0], slots[1], 0, 0],
-        }
-    }
-
-    pub fn new3(slots: [u8; 3]) -> Self {
-        Self {
-            ports: 3,
-            slots: [slots[0], slots[1], slots[2], 0],
-        }
-    }
-
-    pub fn new4(slots: [u8; 4]) -> Self {
-        Self { ports: 4, slots }
-    }
-
-    pub fn slots(&self) -> &[u8] {
-        &self.slots[..self.ports]
-    }
-
-    pub fn len(&self) -> usize {
-        self.ports + 4
-    }
-
-    /// Returns Err(()) if data.len() < self.len()
-    pub fn serialize_to(&self, data: &mut [u8]) -> Result<(), BufferTooSmall> {
-        if data.len() < self.len() {
-            return Err(BufferTooSmall);
-        }
-        data[0..4].copy_from_slice(&(self.ports as i32).to_le_bytes());
-        data[4..][..self.ports].copy_from_slice(&self.slots[..self.ports]);
-        Ok(())
-    }
-
-    pub fn deserialize(data: &[u8]) -> Result<Self, RequestControllerInfoError> {
-        if data.len() < 4 {
-            return Err(RequestControllerInfoError::NotEnoughData);
-        }
-
-        let ports = i32::from_le_bytes(data[0..4].try_into().unwrap());
-        if ports < 1 || 4 < ports {
-            return Err(RequestControllerInfoError::InvalidPortSize(ports));
-        }
-        let ports = ports as usize;
-
-        if data.len() < 4 + ports {
-            return Err(RequestControllerInfoError::NotEnoughData);
-        }
-
-        let mut slots = [0; 4];
-        slots[..ports].copy_from_slice(&data[4..][..ports]);
-
-        Ok(Self { ports, slots })
+impl<'a> RequestControllerData<'a, Ref> {
+    pub fn mac(&self) -> &[u8; 6] {
+        self.buf[22..28].try_into().unwrap()
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ControllerInfoMessage(pub ControllerInfo);
-
-impl ControllerInfoMessage {
-    pub const LENGTH: usize = 12;
-
-    pub fn serialize(&self) -> [u8; Self::LENGTH] {
-        let mut data = [0; Self::LENGTH];
-        self.serialize_to(&mut data);
-        data
+impl<'a> RequestControllerData<'a, Mut> {
+    pub fn initialize<H: Hasher>(
+        &mut self,
+        sender_id: u32,
+        registration: Registration,
+        slot: u8,
+        mac: [u8; 6],
+        hasher: H,
+    ) {
+        self.header_mut().initialize(
+            Magic::Client,
+            Protocol::Version1001,
+            28 - 16,
+            0,
+            sender_id,
+            MessageType::ControllerData,
+        );
+        self.set_registration(registration);
+        self.set_slot(slot);
+        *self.mac_mut() = mac;
+        self.update_crc(hasher);
     }
 
-    pub fn serialize_to(&self, data: &mut [u8; Self::LENGTH]) {
-        self.0
-            .serialize_to(&mut data[..ControllerInfo::LENGTH].try_into().unwrap());
-        data[11] = 0;
+    pub fn mac(&self) -> &[u8; 6] {
+        self.buf[22..28].try_into().unwrap()
     }
 
-    pub fn deserialize(data: &[u8; Self::LENGTH]) -> Result<Self, ControllerInfoError> {
-        ControllerInfo::deserialize(&data[..ControllerInfo::LENGTH].try_into().unwrap()).map(Self)
+    pub fn mac_mut(&mut self) -> &mut [u8; 6] {
+        (&mut self.buf[22..28]).try_into().unwrap()
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RegisterType {
-    AllControllers,
-    SlotBased(u8),
-    MacBased([u8; 6]),
-}
+impl_new!(
+    RequestControllerData,
+    sender_id: u32,
+    registration: Registration,
+    slot: u8,
+    mac: [u8; 6],
+);
 
-#[derive(Clone, Debug)]
-pub struct RequestControllerDataMessage(pub RegisterType);
+buf_type!(message ControllerData, 100);
 
-impl RequestControllerDataMessage {
-    pub const LENGTH: usize = 8;
+sub_fields!(ControllerData,
+    header header_mut: Header = 0..20,
+    controller_header controller_header_mut: ControllerHeader = 20..31,
+    touch1 touch1_mut: Touch = 56..62,
+    touch2 touch2_mut: Touch = 62..68,
+);
 
-    pub fn serialize(&self) -> [u8; Self::LENGTH] {
-        let mut data = [0; Self::LENGTH];
-        self.serialize_to(&mut data);
-        data
+int_fields!(ControllerData,
+    packet_number     set_packet_number:     u32 = 32..36,
+    ps_button         set_ps_button:         u8  = 38..39,
+    touch_button      set_touch_button:      u8  = 39..40,
+    left_stick_x      set_left_stick_x:      u8  = 40..41,
+    left_stick_y      set_left_stick_y:      u8  = 41..42,
+    right_stick_x     set_right_stick_x:     u8  = 42..43,
+    right_stick_y     set_right_stick_y:     u8  = 43..44,
+    analog_dpad_left  set_analog_dpad_left:  u8  = 44..45,
+    analog_dpad_down  set_analog_dpad_down:  u8  = 45..46,
+    analog_dpad_right set_analog_dpad_right: u8  = 46..47,
+    analog_dpad_up    set_analog_dpad_up:    u8  = 47..48,
+    analog_y          set_analog_y:          u8  = 48..49,
+    analog_b          set_analog_b:          u8  = 49..50,
+    analog_a          set_analog_a:          u8  = 50..51,
+    analog_x          set_analog_x:          u8  = 51..52,
+    analog_r1         set_analog_r1:         u8  = 52..53,
+    analog_l1         set_analog_l1:         u8  = 53..54,
+    analog_r2         set_analog_r2:         u8  = 54..55,
+    analog_l2         set_analog_l2:         u8  = 55..56,
+    motion_timestamp  set_motion_timestamp:  u64 = 68..76,
+    accel_x           set_accel_x:           f32 = 76..80,
+    accel_y           set_accel_y:           f32 = 80..84,
+    accel_z           set_accel_z:           f32 = 84..88,
+    gyro_pitch        set_gyro_pitch:        f32 = 88..92,
+    gyro_yaw          set_gyro_yaw:          f32 = 92..96,
+    gyro_roll         set_gyro_roll:         f32 = 96..100,
+);
+
+impl<'a> ControllerData<'a, Ref> {
+    pub fn is_connected(&self) -> bool {
+        self.buf[31] != 0
     }
 
-    pub fn serialize_to(&self, data: &mut [u8; Self::LENGTH]) {
-        match &self.0 {
-            RegisterType::AllControllers => {
-                data[0] = 0;
-                data[1..8].copy_from_slice(&[0; 7]);
+    pub fn buttons(&self) -> Buttons {
+        Buttons(self.buf[36..38].try_into().unwrap())
+    }
+}
+
+impl<'a> ControllerData<'a, Mut> {
+    pub fn initialize<H: Hasher>(
+        &mut self,
+        sender_id: u32,
+        slot: u8,
+        state: State,
+        model: Model,
+        connection_type: ConnectionType,
+        mac: [u8; 6],
+        battery_status: BatteryStatus,
+        connected: bool,
+        hasher: H,
+    ) {
+        self.header_mut().initialize(
+            Magic::Server,
+            Protocol::Version1001,
+            100 - 16,
+            0,
+            sender_id,
+            MessageType::ControllerData,
+        );
+        self.controller_header_mut().initialize(
+            slot,
+            state,
+            model,
+            connection_type,
+            mac,
+            battery_status,
+        );
+        self.set_connected(connected);
+        self.update_crc(hasher);
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.buf[31] != 0
+    }
+
+    pub fn set_connected(&mut self, val: bool) {
+        self.buf[31] = if val { 1 } else { 0 };
+    }
+
+    pub fn buttons(&self) -> Buttons {
+        Buttons(self.buf[36..38].try_into().unwrap())
+    }
+
+    pub fn set_buttons(&mut self, buttons: Buttons) {
+        self.buf[36] = buttons.0[0];
+        self.buf[37] = buttons.0[1];
+    }
+
+    pub fn clear_analog_buttons(&mut self) {
+        self.set_analog_dpad_left(0);
+        self.set_analog_dpad_down(0);
+        self.set_analog_dpad_right(0);
+        self.set_analog_dpad_up(0);
+        self.set_analog_y(0);
+        self.set_analog_b(0);
+        self.set_analog_a(0);
+        self.set_analog_x(0);
+        self.set_analog_r1(0);
+        self.set_analog_l1(0);
+        self.set_analog_r2(0);
+        self.set_analog_l2(0);
+    }
+}
+
+impl_new!(
+    ControllerData,
+    sender_id: u32,
+    slot: u8,
+    state: State,
+    model: Model,
+    connection_type: ConnectionType,
+    mac: [u8; 6],
+    battery_status: BatteryStatus,
+    connected: bool,
+);
+
+buf_type!(Touch, 6);
+
+int_fields!(Touch,
+    touch_id set_touch_id: u8 = 1..2,
+    touch_x  set_touch_x:  u8 = 2..4,
+    touch_y  set_touch_y:  u8 = 4..6,
+);
+
+impl<'a> Touch<'a, Ref> {
+    pub fn is_active(&self) -> bool {
+        self.buf[0] != 0
+    }
+}
+
+impl<'a> Touch<'a, Mut> {
+    pub fn is_active(&self) -> bool {
+        self.buf[0] != 0
+    }
+
+    pub fn set_active(&mut self, val: bool) {
+        self.buf[0] = if val { 1 } else { 0 };
+    }
+}
+
+pub enum MessageRef<'a> {
+    RequestProtocolVersionInfo(RequestProtocolVersionInfo<'a, Ref>),
+    ProtocolVersionInfo(ProtocolVersionInfo<'a, Ref>),
+    RequestControllerInfo(RequestControllerInfo<'a, Ref>),
+    ControllerInfo(ControllerInfo<'a, Ref>),
+    RequestControllerData(RequestControllerData<'a, Ref>),
+    ControllerData(ControllerData<'a, Ref>),
+}
+
+impl<'a> MessageRef<'a> {
+    pub fn parse<H: Hasher>(buf: &'a [u8], mut hasher: H) -> Result<Self, MessageParseError> {
+        let header = Header::from_ref(
+            buf[0..20].try_into()
+                .map_err(|_| MessageParseError::SliceTooSmall)?,
+        );
+        let magic = header
+            .magic()
+            .map_err(|Invalid(magic, _)| MessageParseError::InvalidMagic(magic))?;
+        let message_type = header
+            .message_type()
+            .map_err(|Invalid(id, _)| MessageParseError::InvalidMessageId(id))?;
+
+        let this = match (magic, message_type) {
+            (Magic::Client, MessageType::ProtocolVersionInfo) => {
+                Self::RequestProtocolVersionInfo(RequestProtocolVersionInfo::from_ref(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
             }
-            RegisterType::SlotBased(slot) => {
-                data[0] = 1;
-                data[1] = *slot;
-                data[2..8].copy_from_slice(&[0; 6]);
+            (Magic::Server, MessageType::ProtocolVersionInfo) => {
+                Self::ProtocolVersionInfo(ProtocolVersionInfo::from_ref(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
             }
-            RegisterType::MacBased(mac) => {
-                data[0] = 2;
-                data[1] = 0;
-                data[2..8].copy_from_slice(mac);
+            (Magic::Client, MessageType::ControllerInfo) => {
+                Self::RequestControllerInfo(RequestControllerInfo::from_ref(buf))
             }
+            (Magic::Server, MessageType::ControllerInfo) => {
+                Self::ControllerInfo(ControllerInfo::from_ref(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
+            }
+            (Magic::Client, MessageType::ControllerData) => {
+                Self::RequestControllerData(RequestControllerData::from_ref(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
+            }
+            (Magic::Server, MessageType::ControllerData) => {
+                Self::ControllerData(ControllerData::from_ref(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
+            }
+        };
+
+        let bytes = match &this {
+            Self::RequestProtocolVersionInfo(v) => v.bytes(),
+            Self::ProtocolVersionInfo(v) => v.bytes(),
+            Self::RequestControllerInfo(v) => v.bytes(),
+            Self::ControllerInfo(v) => v.bytes(),
+            Self::RequestControllerData(v) => v.bytes(),
+            Self::ControllerData(v) => v.bytes(),
+        };
+        hasher.write(&bytes[0..8]);
+        hasher.write(&[0u8; 4]);
+        hasher.write(&bytes[12..]);
+        let calc_hash = hasher.finish() as u32;
+        let hash = this.header().crc32();
+        if hash != calc_hash {
+            return Err(MessageParseError::InvalidCrc32 {
+                expected: hash,
+                calculated: calc_hash,
+            });
         }
+
+        Ok(this)
     }
 
-    pub fn deserialize(data: &[u8; Self::LENGTH]) -> Result<Self, RequestControllerDataError> {
-        match data[0] {
-            0 => Ok(RegisterType::AllControllers),
-            1 if data[1] <= 4 => Ok(RegisterType::SlotBased(data[1])),
-            1 => Err(RequestControllerDataError::InvalidSlot(data[1])),
-            2 => Ok(RegisterType::MacBased(data[2..8].try_into().unwrap())),
-            _ => Err(RequestControllerDataError::InvalidBitmask(data[0])),
-        }
-        .map(RequestControllerDataMessage)
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct Buttons([u8; 2]);
-
-impl Buttons {
-    pub fn new() -> Self {
-        Buttons([0; 2])
-    }
-
-    pub fn clear(&mut self) {
-        self.0 = [0; 2];
-    }
-}
-
-impl std::ops::BitOr<Button> for Buttons {
-    type Output = Buttons;
-
-    fn bitor(mut self, rhs: Button) -> Buttons {
-        let (index, bit) = rhs.index_and_bit();
-        self.0[index] |= 1 << bit;
-        self
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum Button {
-    Left,
-    Down,
-    Right,
-    Up,
-    Start,
-    RStick,
-    LStick,
-    Select,
-    Y,
-    B,
-    A,
-    X,
-    R1,
-    L1,
-    R2,
-    L2,
-}
-
-impl Button {
-    fn index_and_bit(&self) -> (usize, u8) {
+    pub fn header(&self) -> Header<Ref> {
         match self {
-            Button::Left => (7, 0),
-            Button::Down => (6, 0),
-            Button::Right => (5, 0),
-            Button::Up => (4, 0),
-            Button::Start => (3, 0),
-            Button::RStick => (2, 0),
-            Button::LStick => (1, 0),
-            Button::Select => (0, 0),
-            Button::Y => (7, 1),
-            Button::B => (6, 1),
-            Button::A => (5, 1),
-            Button::X => (4, 1),
-            Button::R1 => (3, 1),
-            Button::L1 => (2, 1),
-            Button::R2 => (1, 1),
-            Button::L2 => (0, 1),
+            Self::RequestProtocolVersionInfo(v) => v.header(),
+            Self::ProtocolVersionInfo(v) => v.header(),
+            Self::RequestControllerInfo(v) => v.header(),
+            Self::ControllerInfo(v) => v.header(),
+            Self::RequestControllerData(v) => v.header(),
+            Self::ControllerData(v) => v.header(),
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Motion {
-    pub accel_x: f32,
-    pub accel_y: f32,
-    pub accel_z: f32,
-    pub gyro_pitch: f32,
-    pub gyro_yaw: f32,
-    pub gyro_roll: f32,
+pub enum MessageMut<'a> {
+    RequestProtocolVersionInfo(RequestProtocolVersionInfo<'a, Mut>),
+    ProtocolVersionInfo(ProtocolVersionInfo<'a, Mut>),
+    RequestControllerInfo(RequestControllerInfo<'a, Mut>),
+    ControllerInfo(ControllerInfo<'a, Mut>),
+    RequestControllerData(RequestControllerData<'a, Mut>),
+    ControllerData(ControllerData<'a, Mut>),
 }
 
-impl Motion {
-    pub fn new() -> Self {
-        Motion {
-            accel_x: 0.,
-            accel_y: 0.,
-            accel_z: 0.,
-            gyro_pitch: 0.,
-            gyro_yaw: 0.,
-            gyro_roll: 0.,
-        }
-    }
+impl<'a> MessageMut<'a> {
+    pub fn parse_mut<H: Hasher>(
+        buf: &'a mut [u8],
+        mut hasher: H,
+    ) -> Result<Self, MessageParseError> {
+        let header = Header::from_mut(
+            (&mut buf[0..20]).try_into()
+                .map_err(|_| MessageParseError::SliceTooSmall)?,
+        );
+        let magic = header
+            .magic()
+            .map_err(|Invalid(magic, _)| MessageParseError::InvalidMagic(magic))?;
+        let message_type = header
+            .message_type()
+            .map_err(|Invalid(id, _)| MessageParseError::InvalidMessageId(id))?;
 
-    fn as_array(&self) -> [f32; 6] {
-        [
-            self.accel_x,
-            self.accel_y,
-            self.accel_z,
-            self.gyro_pitch,
-            self.gyro_pitch,
-            self.gyro_roll,
-        ]
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Touch {
-    pub is_active: bool,
-    pub id: u8,
-    pub x: u16,
-    pub y: u16,
-}
-
-impl Touch {
-    const LENGTH: usize = 6;
-
-    pub fn new(id: u8) -> Self {
-        Touch {
-            is_active: false,
-            id: 0,
-            x: 0,
-            y: 0,
-        }
-    }
-
-    fn serialize_to(&self, data: &mut [u8; Self::LENGTH]) {
-        data[0] = if self.is_active { 1 } else { 0 };
-        data[1] = self.id;
-        data[2..4].copy_from_slice(&self.x.to_le_bytes());
-        data[4..6].copy_from_slice(&self.y.to_le_bytes());
-    }
-
-    fn deserialize(data: &[u8; Self::LENGTH]) -> Self {
-        Touch {
-            is_active: data[0] != 0,
-            id: data[1],
-            x: u16::from_le_bytes([data[2], data[3]]),
-            y: u16::from_le_bytes([data[4], data[5]]),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ControllerDataMessage {
-    pub info: ControllerInfo,
-    pub connected: bool,
-    pub packet_number: u32,
-    pub buttons: Buttons,
-    pub ps_button: u8,
-    pub touch_button: u8,
-    pub left_stick_x: u8,
-    pub left_stick_y: u8,
-    pub right_stick_x: u8,
-    pub right_stick_y: u8,
-    pub analog_dpad_left: u8,
-    pub analog_dpad_down: u8,
-    pub analog_dpad_right: u8,
-    pub analog_dpad_up: u8,
-    pub analog_y: u8,
-    pub analog_b: u8,
-    pub analog_a: u8,
-    pub analog_x: u8,
-    pub analog_r1: u8,
-    pub analog_l1: u8,
-    pub analog_r2: u8,
-    pub analog_l2: u8,
-    pub first_touch: Touch,
-    pub second_touch: Touch,
-    pub motion_timestamp: u64,
-    pub motion: Motion,
-}
-
-impl ControllerDataMessage {
-    pub const LENGTH: usize = 80;
-    
-    pub fn new(info: ControllerInfo, connected: bool) -> Self {
-        ControllerDataMessage {
-            info,
-            connected,
-            packet_number: 0,
-            buttons: Buttons::new(),
-            ps_button: 0,
-            touch_button: 0,
-            left_stick_x: 0,
-            left_stick_y: 0,
-            right_stick_x: 0,
-            right_stick_y: 0,
-            analog_dpad_left: 0,
-            analog_dpad_down: 0,
-            analog_dpad_right: 0,
-            analog_dpad_up: 0,
-            analog_y: 0,
-            analog_b: 0,
-            analog_a: 0,
-            analog_x: 0,
-            analog_r1: 0,
-            analog_l1: 0,
-            analog_r2: 0,
-            analog_l2: 0,
-            first_touch: Touch::new(0),
-            second_touch: Touch::new(0),
-            motion_timestamp: 0,
-            motion: Motion::new(),
-        }
-    }
-
-    pub fn serialize(&self) -> [u8; Self::LENGTH] {
-        let mut data = [0; Self::LENGTH];
-        self.serialize_to(&mut data);
-        data
-    }
-
-    pub fn serialize_to(&self, data: &mut [u8; Self::LENGTH]) {
-        self.info.serialize_to(&mut data[0..11].try_into().unwrap());
-        data[11] = if self.connected { 1 } else { 0 };
-        data[12..16].copy_from_slice(&self.packet_number.to_le_bytes());
-        data[16..18].copy_from_slice(&self.buttons.0);
-        data[18] = self.ps_button;
-        data[19] = self.touch_button;
-        data[20] = self.left_stick_x;
-        data[21] = self.left_stick_y;
-        data[22] = self.right_stick_x;
-        data[23] = self.right_stick_y;
-        data[24] = self.analog_dpad_left;
-        data[25] = self.analog_dpad_down;
-        data[26] = self.analog_dpad_right;
-        data[27] = self.analog_dpad_up;
-        data[28] = self.analog_y;
-        data[29] = self.analog_b;
-        data[30] = self.analog_a;
-        data[31] = self.analog_x;
-        data[32] = self.analog_r1;
-        data[33] = self.analog_l1;
-        data[34] = self.analog_r2;
-        data[35] = self.analog_l2;
-        self.first_touch
-            .serialize_to(&mut data[36..42].try_into().unwrap());
-        self.second_touch
-            .serialize_to(&mut data[42..48].try_into().unwrap());
-        data[48..56].copy_from_slice(&self.motion_timestamp.to_le_bytes());
-        for i in 0..6 {
-            data[(56 + i * 4)..][..4].copy_from_slice(&self.motion.as_array()[i].to_le_bytes());
-        }
-    }
-
-    pub fn deserialize(data: &[u8; Self::LENGTH]) -> Result<Self, ControllerInfoError> {
-        let info =
-            ControllerInfo::deserialize(data[0..ControllerInfo::LENGTH].try_into().unwrap())?;
-
-        let mut motion = [0.0; 6];
-        for i in 0..6 {
-            motion[i] = f32::from_le_bytes(data[(56 + i * 4)..][..4].try_into().unwrap());
-        }
-
-        Ok(ControllerDataMessage {
-            info,
-            connected: data[11] != 0,
-            packet_number: u32::from_le_bytes(data[12..16].try_into().unwrap()),
-            buttons: Buttons([data[16], data[17]]),
-            ps_button: data[18],
-            touch_button: data[19],
-            left_stick_x: data[20],
-            left_stick_y: data[21],
-            right_stick_x: data[22],
-            right_stick_y: data[23],
-            analog_dpad_left: data[24],
-            analog_dpad_down: data[25],
-            analog_dpad_right: data[26],
-            analog_dpad_up: data[27],
-            analog_y: data[28],
-            analog_b: data[29],
-            analog_a: data[30],
-            analog_x: data[31],
-            analog_r1: data[32],
-            analog_l1: data[33],
-            analog_r2: data[34],
-            analog_l2: data[35],
-            first_touch: Touch::deserialize(&data[36..42].try_into().unwrap()),
-            second_touch: Touch::deserialize(&data[42..48].try_into().unwrap()),
-            motion_timestamp: u64::from_le_bytes(data[48..56].try_into().unwrap()),
-            motion: Motion {
-                accel_x: motion[0],
-                accel_y: motion[1],
-                accel_z: motion[2],
-                gyro_pitch: motion[3],
-                gyro_yaw: motion[4],
-                gyro_roll: motion[5],
-            },
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Message {
-    header: MessageHeader,
-    kind: MessageKind,
-}
-
-impl Message {
-    /// The constructor will set the header length, crc, and type fields appropriately
-    pub fn new(mut header: MessageHeader, kind: MessageKind) -> Self {
-        header.message_type = kind.message_type();
-        header.length = kind.len() as u16 + 4;
-        header.crc32_hash = 0;
-
-        Message { header, kind }
-    }
-
-    pub fn header(&self) -> &MessageHeader {
-        &self.header
-    }
-
-    pub fn kind(&self) -> &MessageKind {
-        &self.kind
-    }
-
-    pub fn serialize_to(&self, data: &mut [u8], crc_func: impl FnOnce(&[u8]) -> u32) -> Result<(), BufferTooSmall> {
-        if self.len() > data.len() {
-            return Err(BufferTooSmall);
-        }
-        self.header.serialize_to(&mut data[0..MessageHeader::LENGTH].try_into().unwrap());
-        self.kind.serialize_to(&mut data[MessageHeader::LENGTH..])?;
-        let crc32_hash = crc_func(&data[..self.len()]);
-        data[8..12].copy_from_slice(&crc32_hash.to_le_bytes());
-        
-        Ok(())
-    }
-
-    /// Maximum len is 100 (BUFFER_SIZE)
-    /// Minimum len is 20
-    pub fn len(&self) -> usize {
-        self.kind.len() + MessageHeader::LENGTH
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum MessageKind {
-    RequestProtocolInfo(RequestProtocolInfoMessage),
-    ProtocolInfo(ProtocolInfoMessage),
-    RequestControllerInfo(RequestControllerInfoMessage),
-    ControllerInfo(ControllerInfoMessage),
-    RequestControllerData(RequestControllerDataMessage),
-    ControllerData(ControllerDataMessage),
-}
-
-impl MessageKind {
-    pub fn message_type(&self) -> MessageType {
-        match self {
-            MessageKind::RequestProtocolInfo(_) | MessageKind::ProtocolInfo(_) => {
-                MessageType::ProtocolVersionInfo
+        let this = match (magic, message_type) {
+            (Magic::Client, MessageType::ProtocolVersionInfo) => {
+                Self::RequestProtocolVersionInfo(RequestProtocolVersionInfo::from_mut(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
             }
-            MessageKind::RequestControllerInfo(_) | MessageKind::ControllerInfo(_) => {
-                MessageType::ControllerInfo
+            (Magic::Server, MessageType::ProtocolVersionInfo) => {
+                Self::ProtocolVersionInfo(ProtocolVersionInfo::from_mut(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
             }
-            MessageKind::RequestControllerData(_) | MessageKind::ControllerData(_) => {
-                MessageType::ControllerData
+            (Magic::Client, MessageType::ControllerInfo) => {
+                Self::RequestControllerInfo(RequestControllerInfo::from_mut(buf))
             }
+            (Magic::Server, MessageType::ControllerInfo) => {
+                Self::ControllerInfo(ControllerInfo::from_mut(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
+            }
+            (Magic::Client, MessageType::ControllerData) => {
+                Self::RequestControllerData(RequestControllerData::from_mut(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
+            }
+            (Magic::Server, MessageType::ControllerData) => {
+                Self::ControllerData(ControllerData::from_mut(
+                    buf.try_into()
+                        .map_err(|_| MessageParseError::SliceTooSmall)?,
+                ))
+            }
+        };
+
+        let bytes = match &this {
+            Self::RequestProtocolVersionInfo(v) => v.bytes(),
+            Self::ProtocolVersionInfo(v) => v.bytes(),
+            Self::RequestControllerInfo(v) => v.bytes(),
+            Self::ControllerInfo(v) => v.bytes(),
+            Self::RequestControllerData(v) => v.bytes(),
+            Self::ControllerData(v) => v.bytes(),
+        };
+        hasher.write(&bytes[0..8]);
+        hasher.write(&[0u8; 4]);
+        hasher.write(&bytes[12..]);
+        let calc_hash = hasher.finish() as u32;
+        let hash = this.header().crc32();
+        if hash != calc_hash {
+            return Err(MessageParseError::InvalidCrc32 {
+                expected: hash,
+                calculated: calc_hash,
+            });
+        }
+
+        Ok(this)
+    }
+
+    pub fn header(&self) -> Header<Ref> {
+        match self {
+            Self::RequestProtocolVersionInfo(v) => v.header(),
+            Self::ProtocolVersionInfo(v) => v.header(),
+            Self::RequestControllerInfo(v) => v.header(),
+            Self::ControllerInfo(v) => v.header(),
+            Self::RequestControllerData(v) => v.header(),
+            Self::ControllerData(v) => v.header(),
         }
     }
 
-    /// Length of the message body (not including the message_type field)
-    pub fn len(&self) -> usize {
+    pub fn header_mut(&mut self) -> Header<Mut> {
         match self {
-            MessageKind::RequestProtocolInfo(_) => RequestProtocolInfoMessage::LENGTH,
-            MessageKind::ProtocolInfo(_) => ProtocolInfoMessage::LENGTH,
-            MessageKind::RequestControllerInfo(msg) => msg.len(),
-            MessageKind::ControllerInfo(_) => ControllerInfoMessage::LENGTH,
-            MessageKind::RequestControllerData(_) => RequestControllerDataMessage::LENGTH,
-            MessageKind::ControllerData(_) => ControllerDataMessage::LENGTH,
+            Self::RequestProtocolVersionInfo(v) => v.header_mut(),
+            Self::ProtocolVersionInfo(v) => v.header_mut(),
+            Self::RequestControllerInfo(v) => v.header_mut(),
+            Self::ControllerInfo(v) => v.header_mut(),
+            Self::RequestControllerData(v) => v.header_mut(),
+            Self::ControllerData(v) => v.header_mut(),
         }
-    }
-
-    fn serialize_to(&self, data: &mut [u8]) -> Result<(), BufferTooSmall> {
-        if self.len() > data.len() {
-            return Err(BufferTooSmall);
-        }
-
-        match self {
-            MessageKind::RequestProtocolInfo(m) => {},
-            MessageKind::ProtocolInfo(m) => m.serialize_to(&mut data[..ProtocolInfoMessage::LENGTH].try_into().unwrap()),
-            MessageKind::RequestControllerInfo(m) => m.serialize_to(data)?,
-            MessageKind::ControllerInfo(m) => m.serialize_to(&mut data[..ControllerInfoMessage::LENGTH].try_into().unwrap()),
-            MessageKind::RequestControllerData(m) => m.serialize_to(&mut data[..RequestControllerDataMessage::LENGTH].try_into().unwrap()),
-            MessageKind::ControllerData(m) => m.serialize_to(&mut data[..ControllerDataMessage::LENGTH].try_into().unwrap()),
-        }
-
-        Ok(())
     }
 }
