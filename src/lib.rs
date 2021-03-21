@@ -103,25 +103,6 @@ macro_rules! buf_type {
             }
         }
     };
-    (dynamic message $name:ident, $size:literal) => {
-        pub struct $name<'a, A: Access<'a, $size> = Owned> {
-            buf: A::Buffer,
-        }
-
-        impl<'a> $name<'a, Owned> {
-            fn new_uninit() -> Self {
-                Self { buf: [0; $size] }
-            }
-
-            pub fn get(&self) -> $name<Ref> {
-                $name::<Ref>::from_ref(&self.buf)
-            }
-
-            pub fn get_mut(&mut self) -> $name<Mut> {
-                $name::<Mut>::from_mut(&mut self.buf)
-            }
-        }
-    };
 }
 
 macro_rules! impl_new {
@@ -399,46 +380,28 @@ impl<'a> ControllerHeader<'a, Mut> {
     }
 }
 
-buf_type!(dynamic message RequestControllerInfo, 28);
+buf_type!(message RequestControllerInfo, 28);
 
 sub_fields!(RequestControllerInfo,
     header header_mut: Header = 0..20,
 );
 
 impl<'a> RequestControllerInfo<'a, Ref> {
-    pub fn from_ref(buf: &'a [u8]) -> Self {
-        Self { buf }
-    }
-
     pub fn slots(&self) -> Result<&[u8], RequestControllerInfoError> {
         let port = self.num_slots()? as usize;
-        if self.buf.len() < 20 + 4 + port {
-            return Err(RequestControllerInfoError::SliceTooSmall);
-        }
         Ok(&self.buf[24..][..port])
     }
 
     pub fn num_slots(&self) -> Result<usize, RequestControllerInfoError> {
-        if self.buf.len() < 20 + 4 {
-            return Err(RequestControllerInfoError::SliceTooSmall);
-        }
         let port = i32::from_le_bytes(self.buf[20..24].try_into().unwrap());
         if port < 0 || 4 < port {
             return Err(RequestControllerInfoError::InvalidSlotsLength(port));
         }
         Ok(port as usize)
     }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.buf[..28]
-    }
 }
 
 impl<'a> RequestControllerInfo<'a, Mut> {
-    pub fn from_mut(buf: &'a mut [u8]) -> Self {
-        Self { buf }
-    }
-
     pub fn initialize<H: Hasher>(
         &mut self,
         sender_id: u32,
@@ -455,27 +418,12 @@ impl<'a> RequestControllerInfo<'a, Mut> {
             MessageType::ProtocolVersionInfo,
         );
         self.set_slots(slots)?;
-        self.update_crc(hasher)?;
-        Ok(())
-    }
-
-    pub fn update_crc<H: Hasher>(
-        &mut self,
-        mut hasher: H,
-    ) -> Result<(), RequestControllerInfoError> {
-        let len = self.num_slots()?;
-        hasher.write(&self.buf[0..8]);
-        hasher.write(&[0u8; 4]);
-        hasher.write(&self.buf[12..(24 + len)]);
-        self.header_mut().set_crc32(hasher.finish() as u32);
+        self.update_crc(hasher);
         Ok(())
     }
 
     pub fn slots(&self) -> Result<&[u8], RequestControllerInfoError> {
         let port = self.num_slots()? as usize;
-        if self.buf.len() < 20 + 4 + port {
-            return Err(RequestControllerInfoError::SliceTooSmall);
-        }
         Ok(&self.buf[24..][..port])
     }
 
@@ -485,36 +433,22 @@ impl<'a> RequestControllerInfo<'a, Mut> {
                 slots.len() as u32 as i32,
             ));
         }
-        if self.buf.len() < 20 + 4 + slots.len() {
-            return Err(RequestControllerInfoError::SliceTooSmall);
-        }
         self.buf[20..24].copy_from_slice(&(slots.len() as i32).to_le_bytes());
         self.buf[24..][..slots.len()].copy_from_slice(slots);
         Ok(())
     }
 
     pub fn num_slots(&self) -> Result<usize, RequestControllerInfoError> {
-        if self.buf.len() < 20 + 4 {
-            return Err(RequestControllerInfoError::SliceTooSmall);
-        }
         let port = i32::from_le_bytes(self.buf[20..24].try_into().unwrap());
         if port < 0 || 4 < port {
             return Err(RequestControllerInfoError::InvalidSlotsLength(port));
         }
         Ok(port as usize)
     }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.buf[..28]
-    }
-
-    pub fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..28]
-    }
 }
 
 impl<'a> RequestControllerInfo<'a, Owned> {
-    pub fn new_owned<H: Hasher>(
+    pub fn new<H: Hasher>(
         sender_id: u32,
         slots: &[u8],
         hasher: H,
@@ -825,7 +759,8 @@ impl<'a> MessageRef<'a> {
                 ))
             }
             (Magic::Client, MessageType::ControllerInfo) => {
-                Self::RequestControllerInfo(RequestControllerInfo::from_ref(buf))
+                Self::RequestControllerInfo(RequestControllerInfo::from_ref(buf.try_into()
+                .map_err(|_| MessageParseError::SliceTooSmall)?,))
             }
             (Magic::Server, MessageType::ControllerInfo) => {
                 Self::ControllerInfo(ControllerInfo::from_ref(
@@ -921,7 +856,8 @@ impl<'a> MessageMut<'a> {
                 ))
             }
             (Magic::Client, MessageType::ControllerInfo) => {
-                Self::RequestControllerInfo(RequestControllerInfo::from_mut(buf))
+                Self::RequestControllerInfo(RequestControllerInfo::from_mut(buf.try_into()
+                .map_err(|_| MessageParseError::SliceTooSmall)?,))
             }
             (Magic::Server, MessageType::ControllerInfo) => {
                 Self::ControllerInfo(ControllerInfo::from_mut(

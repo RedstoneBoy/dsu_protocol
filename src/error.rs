@@ -15,8 +15,6 @@ impl<T: Display> Display for Invalid<T> {
 #[derive(Clone, Debug)]
 pub enum RequestControllerInfoError {
     InvalidSlotsLength(i32),
-    InvalidSlotValue(u8),
-    SliceTooSmall,
 }
 
 impl StdError for RequestControllerInfoError {}
@@ -27,12 +25,6 @@ impl Display for RequestControllerInfoError {
         match self {
             RequestControllerInfoError::InvalidSlotsLength(val) => {
                 write!(f, "invalid slot length {}", val)?;
-            }
-            RequestControllerInfoError::InvalidSlotValue(val) => {
-                write!(f, "invalid slot value {}", val)?;
-            }
-            RequestControllerInfoError::SliceTooSmall => {
-                write!(f, "slice is too small")?;
             }
         }
 
