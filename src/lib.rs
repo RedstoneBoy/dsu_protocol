@@ -206,19 +206,6 @@ macro_rules! sub_fields {
     };
 }
 
-/*
-pub struct Message<'a, A: Access<'a, 0>> {
-    header: Header<'a, A>,
-    body: Body<'a, A>,
-}
-
-impl<'a> Message<'a, Ref> {
-    pub fn new(data: &'a [u8]) -> Self {
-        todo!()
-    }
-}
-*/
-
 buf_type!(Header, 20);
 
 int_fields!(Header,
