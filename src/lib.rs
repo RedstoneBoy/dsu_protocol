@@ -1,7 +1,7 @@
 pub mod error;
 pub mod types;
 
-use core::convert::TryInto;
+use core::convert::{TryFrom, TryInto};
 use core::hash::Hasher;
 
 use error::*;
@@ -14,106 +14,99 @@ pub const MESSAGE_PROTOCOL: u32 = 0x100000;
 pub const MESSAGE_INFO: u32 = 0x100001;
 pub const MESSAGE_DATA: u32 = 0x100002;
 
-pub trait Access<'a, const SIZE: usize> {
-    type Buffer;
-    type SizedBuffer;
-}
-
-pub struct Ref;
-impl<'a, const SIZE: usize> Access<'a, SIZE> for Ref {
-    type Buffer = &'a [u8];
-    type SizedBuffer = &'a [u8; SIZE];
-}
-
-pub struct Mut;
-impl<'a, const SIZE: usize> Access<'a, SIZE> for Mut {
-    type Buffer = &'a mut [u8];
-    type SizedBuffer = &'a mut [u8; SIZE];
-}
-
-pub struct Owned;
-impl<'a, const SIZE: usize> Access<'a, SIZE> for Owned {
-    type Buffer = [u8; SIZE];
-    type SizedBuffer = [u8; SIZE];
+trait BufType {
+    const SIZE: usize;
 }
 
 macro_rules! buf_type {
     (message $name:ident, $size:literal) => {
         buf_type!($name, $size);
 
-        impl<'a> $name<'a, Mut> {
+        impl $name {
             pub fn update_crc<H: Hasher>(&mut self, mut hasher: H) {
-                hasher.write(&self.buf[0..8]);
+                hasher.write(&self.bytes[0..8]);
                 hasher.write(&[0u8; 4]);
-                hasher.write(&self.buf[12..]);
+                hasher.write(&self.bytes[12..]);
                 self.header_mut().set_crc32(hasher.finish() as u32);
             }
         }
-
-        impl<'a> $name<'a, Owned> {
-            fn new_uninit() -> Self {
-                Self { buf: [0; $size] }
-            }
-
-            pub fn get(&self) -> $name<Ref> {
-                $name::<Ref>::from_ref(&self.buf)
-            }
-
-            pub fn get_mut(&mut self) -> $name<Mut> {
-                $name::<Mut>::from_mut(&mut self.buf)
-            }
-        }
     };
-    ($name:ident, $size:literal) => {
-        pub struct $name<'a, A: Access<'a, $size> = Owned> {
-            buf: A::SizedBuffer,
+    ($name:ident, $size:expr) => {
+        #[repr(transparent)]
+        #[derive(Clone)]
+        pub struct $name {
+            pub bytes: [u8; $size],
         }
 
-        impl<'a> $name<'a, Ref> {
-            pub fn bytes(&self) -> &[u8] {
-                self.buf
+        impl $name {
+            pub fn from_ref(bytes: &[u8; $size]) -> &Self {
+                <&Self>::from(bytes)
             }
 
-            pub fn from_ref(buf: &'a [u8; $size]) -> Self {
-                Self { buf }
-            }
-        }
-
-        impl<'a> $name<'a, Mut> {
-            pub fn bytes(&self) -> &[u8] {
-                self.buf
-            }
-
-            pub fn bytes_mut(&mut self) -> &mut [u8] {
-                self.buf
-            }
-
-            pub fn from_mut(buf: &'a mut [u8; $size]) -> Self {
-                Self { buf }
+            pub fn from_mut(bytes: &mut [u8; $size]) -> &mut Self {
+                <&mut Self>::from(bytes)
             }
         }
 
-        impl<'a> $name<'a, Owned> {
-            pub fn bytes(&self) -> &[u8] {
-                &self.buf
-            }
+        impl BufType for $name {
+            const SIZE: usize = $size;
+        }
 
-            pub fn bytes_mut(&mut self) -> &mut [u8] {
-                &mut self.buf
+        impl<'a> From<&'a [u8; $size]> for &'a $name {
+            fn from(bytes: &'a [u8; $size]) -> Self {
+                unsafe { std::mem::transmute(bytes) }
+            }
+        }
+
+        impl<'a> TryFrom<&'a [u8]> for &'a $name {
+            type Error = std::array::TryFromSliceError;
+
+            fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
+                let bytes = <&[u8; $size] as TryFrom<&[u8]>>::try_from(bytes)?;
+                Ok(Self::from(bytes))
+            }
+        }
+
+        impl<'a> TryFrom<&'a mut [u8]> for &'a mut $name {
+            type Error = std::array::TryFromSliceError;
+
+            fn try_from(bytes: &'a mut [u8]) -> Result<Self, Self::Error> {
+                let bytes = <&mut [u8; $size] as TryFrom<&mut [u8]>>::try_from(bytes)?;
+                Ok(Self::from(bytes))
+            }
+        }
+
+        impl<'a> From<&'a mut [u8; $size]> for &'a mut $name {
+            fn from(bytes: &'a mut [u8; $size]) -> Self {
+                unsafe { std::mem::transmute(bytes) }
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = [u8; $size];
+            
+            fn deref(&self) -> &[u8; $size] {
+                &self.bytes
+            }
+        }
+
+        impl std::ops::DerefMut for $name {
+            fn deref_mut(&mut self) -> &mut [u8; $size] {
+                &mut self.bytes
             }
         }
     };
 }
 
 macro_rules! impl_new {
-    ($name:ident, $($field:ident : $fieldty:ty),* $(,)?) => {
-        impl<'a> $name<'a, Owned> {
+    ($name:ty, $($field:ident : $fieldty:ty),* $(,)?) => {
+        impl $name {
             pub fn new<H: Hasher>(
                 $($field: $fieldty,)*
                 hasher: H
             ) -> Self {
-                let mut this = Self::new_uninit();
-                this.get_mut().initialize(
+                let mut this = Self { bytes: [0; <Self as BufType>::SIZE] };
+                this.initialize(
                     $($field,)*
                     hasher,
                 );
@@ -124,23 +117,15 @@ macro_rules! impl_new {
 }
 
 macro_rules! int_fields {
-    ($name:ident, $($field:ident $set_field:ident : $itype:ty = $range:expr),* $(,)?) => {
-        impl<'a> $name<'a, Ref> {
+    ($name:ty, $($field:ident $set_field:ident : $itype:ty = $range:expr),* $(,)?) => {
+        impl $name {
             $(
                 pub fn $field(&self) -> $itype {
-                    <$itype>::from_le_bytes(self.buf[$range].try_into().unwrap())
-                }
-            )*
-        }
-
-        impl<'a> $name<'a, Mut> {
-            $(
-                pub fn $field(&self) -> $itype {
-                    <$itype>::from_le_bytes(self.buf[$range].try_into().unwrap())
+                    <$itype>::from_le_bytes(self.bytes[$range].try_into().unwrap())
                 }
 
                 pub fn $set_field(&mut self, val: $itype) {
-                    self.buf[$range].copy_from_slice(&val.to_le_bytes());
+                    self.bytes[$range].copy_from_slice(&val.to_le_bytes());
                 }
             )*
         }
@@ -148,24 +133,13 @@ macro_rules! int_fields {
 }
 
 macro_rules! enum_fields {
-    ($name:ident, $($field:ident $set_field:ident from $valtype:ty [ $range:expr ] $enumtype:ty = $field_name:literal {
+    ($name:ty, $($field:ident $set_field:ident from $valtype:ty [ $range:expr ] $enumtype:ty = $field_name:literal {
         $($enumraw:expr => $enumval:path,)* $(,)?
     })*) => {
-        impl<'a> $name<'a, Ref> {
+        impl $name {
             $(
                 pub fn $field(&self) -> Result<$enumtype, Invalid<$valtype>> {
-                    match <$valtype>::from_le_bytes(self.buf[$range].try_into().unwrap()) {
-                        $(val if val == $enumraw => Ok($enumval),)*
-                        invalid => Err(Invalid(invalid, $field_name)),
-                    }
-                }
-            )*
-        }
-
-        impl<'a> $name<'a, Mut> {
-            $(
-                pub fn $field(&self) -> Result<$enumtype, Invalid<$valtype>> {
-                    match <$valtype>::from_le_bytes(self.buf[$range].try_into().unwrap()) {
+                    match <$valtype>::from_le_bytes(self.bytes[$range].try_into().unwrap()) {
                         $(val if val == $enumraw => Ok($enumval),)*
                         invalid => Err(Invalid(invalid, $field_name)),
                     }
@@ -175,7 +149,7 @@ macro_rules! enum_fields {
                     let intval: $valtype = match val {
                         $($enumval => $enumraw,)*
                     };
-                    self.buf[$range].copy_from_slice(&intval.to_le_bytes());
+                    self.bytes[$range].copy_from_slice(&intval.to_le_bytes());
                 }
             )*
         }
@@ -183,23 +157,15 @@ macro_rules! enum_fields {
 }
 
 macro_rules! sub_fields {
-    ($name:ident, $($field:ident $field_mut:ident : $ftype:ident = $range:expr),* $(,)?) => {
-        impl<'a> $name<'a, Ref> {
+    ($name:ty, $($field:ident $field_mut:ident : $ftype:ty = $range:expr),* $(,)?) => {
+        impl $name {
             $(
-                pub fn $field(&self) -> $ftype<Ref> {
-                    $ftype::<Ref>::from_ref(self.buf[$range].try_into().unwrap())
-                }
-            )*
-        }
-
-        impl<'a> $name<'a, Mut> {
-            $(
-                pub fn $field(&self) -> $ftype<Ref> {
-                    $ftype::<Ref>::from_ref(self.buf[$range].try_into().unwrap())
+                pub fn $field(&self) -> &$ftype {
+                    <&$ftype>::try_from(&self.bytes[$range]).unwrap()
                 }
 
-                pub fn $field_mut(&mut self) -> $ftype<Mut> {
-                    $ftype::from_mut((&mut self.buf[$range]).try_into().unwrap())
+                pub fn $field_mut(&mut self) -> &mut $ftype {
+                    <&mut $ftype>::try_from(&mut self.bytes[$range]).unwrap()
                 }
             )*
         }
@@ -229,7 +195,7 @@ enum_fields!(Header,
     }
 );
 
-impl<'a> Header<'a, Mut> {
+impl Header {
     pub fn initialize(
         &mut self,
         magic: Magic,
@@ -254,7 +220,7 @@ sub_fields!(RequestProtocolVersionInfo,
     header header_mut: Header = 0..20,
 );
 
-impl<'a> RequestProtocolVersionInfo<'a, Mut> {
+impl RequestProtocolVersionInfo {
     pub fn initialize<H: Hasher>(&mut self, sender_id: u32, hasher: H) {
         self.header_mut().initialize(
             Magic::Client,
@@ -282,7 +248,7 @@ enum_fields!(ProtocolVersionInfo,
     }
 );
 
-impl<'a> ProtocolVersionInfo<'a, Mut> {
+impl ProtocolVersionInfo {
     pub fn initialize<H: Hasher>(&mut self, sender_id: u32, protocol: Protocol, hasher: H) {
         self.header_mut().initialize(
             Magic::Server,
@@ -334,13 +300,7 @@ enum_fields!(ControllerHeader,
     }
 );
 
-impl<'a> ControllerHeader<'a, Ref> {
-    pub fn mac(&self) -> &[u8; 6] {
-        self.buf[4..10].try_into().unwrap()
-    }
-}
-
-impl<'a> ControllerHeader<'a, Mut> {
+impl ControllerHeader {
     pub fn initialize(
         &mut self,
         slot: u8,
@@ -359,11 +319,11 @@ impl<'a> ControllerHeader<'a, Mut> {
     }
 
     pub fn mac(&self) -> &[u8; 6] {
-        self.buf[4..10].try_into().unwrap()
+        self.bytes[4..10].try_into().unwrap()
     }
 
     pub fn mac_mut(&mut self) -> &mut [u8; 6] {
-        (&mut self.buf[4..10]).try_into().unwrap()
+        (&mut self.bytes[4..10]).try_into().unwrap()
     }
 }
 
@@ -373,22 +333,7 @@ sub_fields!(RequestControllerInfo,
     header header_mut: Header = 0..20,
 );
 
-impl<'a> RequestControllerInfo<'a, Ref> {
-    pub fn slots(&self) -> Result<&[u8], RequestControllerInfoError> {
-        let port = self.num_slots()? as usize;
-        Ok(&self.buf[24..][..port])
-    }
-
-    pub fn num_slots(&self) -> Result<usize, RequestControllerInfoError> {
-        let port = i32::from_le_bytes(self.buf[20..24].try_into().unwrap());
-        if port < 0 || 4 < port {
-            return Err(RequestControllerInfoError::InvalidSlotsLength(port));
-        }
-        Ok(port as usize)
-    }
-}
-
-impl<'a> RequestControllerInfo<'a, Mut> {
+impl RequestControllerInfo {
     pub fn initialize<H: Hasher>(
         &mut self,
         sender_id: u32,
@@ -411,7 +356,7 @@ impl<'a> RequestControllerInfo<'a, Mut> {
 
     pub fn slots(&self) -> Result<&[u8], RequestControllerInfoError> {
         let port = self.num_slots()? as usize;
-        Ok(&self.buf[24..][..port])
+        Ok(&self.bytes[24..][..port])
     }
 
     pub fn set_slots(&mut self, slots: &[u8]) -> Result<(), RequestControllerInfoError> {
@@ -420,13 +365,13 @@ impl<'a> RequestControllerInfo<'a, Mut> {
                 slots.len() as u32 as i32,
             ));
         }
-        self.buf[20..24].copy_from_slice(&(slots.len() as i32).to_le_bytes());
-        self.buf[24..][..slots.len()].copy_from_slice(slots);
+        self.bytes[20..24].copy_from_slice(&(slots.len() as i32).to_le_bytes());
+        self.bytes[24..][..slots.len()].copy_from_slice(slots);
         Ok(())
     }
 
     pub fn num_slots(&self) -> Result<usize, RequestControllerInfoError> {
-        let port = i32::from_le_bytes(self.buf[20..24].try_into().unwrap());
+        let port = i32::from_le_bytes(self.bytes[20..24].try_into().unwrap());
         if port < 0 || 4 < port {
             return Err(RequestControllerInfoError::InvalidSlotsLength(port));
         }
@@ -434,14 +379,14 @@ impl<'a> RequestControllerInfo<'a, Mut> {
     }
 }
 
-impl<'a> RequestControllerInfo<'a, Owned> {
+impl RequestControllerInfo {
     pub fn new<H: Hasher>(
         sender_id: u32,
         slots: &[u8],
         hasher: H,
     ) -> Result<Self, RequestControllerInfoError> {
-        let mut this = Self::new_uninit();
-        this.get_mut().initialize(sender_id, slots, hasher)?;
+        let mut this = Self { bytes: [0; 28] };
+        this.initialize(sender_id, slots, hasher)?;
         Ok(this)
     }
 }
@@ -453,7 +398,7 @@ sub_fields!(ControllerInfo,
     controller_header controller_header_mut: ControllerHeader = 20..31,
 );
 
-impl<'a> ControllerInfo<'a, Mut> {
+impl ControllerInfo {
     pub fn initialize<H: Hasher>(
         &mut self,
         sender_id: u32,
@@ -514,13 +459,7 @@ enum_fields!(RequestControllerData,
     }
 );
 
-impl<'a> RequestControllerData<'a, Ref> {
-    pub fn mac(&self) -> &[u8; 6] {
-        self.buf[22..28].try_into().unwrap()
-    }
-}
-
-impl<'a> RequestControllerData<'a, Mut> {
+impl RequestControllerData {
     pub fn initialize<H: Hasher>(
         &mut self,
         sender_id: u32,
@@ -544,11 +483,11 @@ impl<'a> RequestControllerData<'a, Mut> {
     }
 
     pub fn mac(&self) -> &[u8; 6] {
-        self.buf[22..28].try_into().unwrap()
+        self.bytes[22..28].try_into().unwrap()
     }
 
     pub fn mac_mut(&mut self) -> &mut [u8; 6] {
-        (&mut self.buf[22..28]).try_into().unwrap()
+        (&mut self.bytes[22..28]).try_into().unwrap()
     }
 }
 
@@ -598,17 +537,7 @@ int_fields!(ControllerData,
     gyro_roll         set_gyro_roll:         f32 = 96..100,
 );
 
-impl<'a> ControllerData<'a, Ref> {
-    pub fn is_connected(&self) -> bool {
-        self.buf[31] != 0
-    }
-
-    pub fn buttons(&self) -> Buttons {
-        Buttons(self.buf[36..38].try_into().unwrap())
-    }
-}
-
-impl<'a> ControllerData<'a, Mut> {
+impl ControllerData {
     pub fn initialize<H: Hasher>(
         &mut self,
         sender_id: u32,
@@ -642,20 +571,20 @@ impl<'a> ControllerData<'a, Mut> {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.buf[31] != 0
+        self.bytes[31] != 0
     }
 
     pub fn set_connected(&mut self, val: bool) {
-        self.buf[31] = if val { 1 } else { 0 };
+        self.bytes[31] = if val { 1 } else { 0 };
     }
 
     pub fn buttons(&self) -> Buttons {
-        Buttons(self.buf[36..38].try_into().unwrap())
+        Buttons(self.bytes[36..38].try_into().unwrap())
     }
 
     pub fn set_buttons(&mut self, buttons: Buttons) {
-        self.buf[36] = buttons.0[0];
-        self.buf[37] = buttons.0[1];
+        self.bytes[36] = buttons.0[0];
+        self.bytes[37] = buttons.0[1];
     }
 
     pub fn clear_analog_buttons(&mut self) {
@@ -694,37 +623,30 @@ int_fields!(Touch,
     touch_y  set_touch_y:  u8 = 4..6,
 );
 
-impl<'a> Touch<'a, Ref> {
+impl Touch {
     pub fn is_active(&self) -> bool {
-        self.buf[0] != 0
-    }
-}
-
-impl<'a> Touch<'a, Mut> {
-    pub fn is_active(&self) -> bool {
-        self.buf[0] != 0
+        self.bytes[0] != 0
     }
 
     pub fn set_active(&mut self, val: bool) {
-        self.buf[0] = if val { 1 } else { 0 };
+        self.bytes[0] = if val { 1 } else { 0 };
     }
 }
 
 pub enum MessageRef<'a> {
-    RequestProtocolVersionInfo(RequestProtocolVersionInfo<'a, Ref>),
-    ProtocolVersionInfo(ProtocolVersionInfo<'a, Ref>),
-    RequestControllerInfo(RequestControllerInfo<'a, Ref>),
-    ControllerInfo(ControllerInfo<'a, Ref>),
-    RequestControllerData(RequestControllerData<'a, Ref>),
-    ControllerData(ControllerData<'a, Ref>),
+    RequestProtocolVersionInfo(&'a RequestProtocolVersionInfo),
+    ProtocolVersionInfo(&'a ProtocolVersionInfo),
+    RequestControllerInfo(&'a RequestControllerInfo),
+    ControllerInfo(&'a ControllerInfo),
+    RequestControllerData(&'a RequestControllerData),
+    ControllerData(&'a ControllerData),
 }
 
 impl<'a> MessageRef<'a> {
     pub fn parse<H: Hasher>(buf: &'a [u8], mut hasher: H) -> Result<Self, MessageParseError> {
-        let header = Header::from_ref(
-            buf[0..20].try_into()
-                .map_err(|_| MessageParseError::SliceTooSmall)?,
-        );
+        let header = <&Header>::try_from(
+            &buf[0..20],
+        ).map_err(|_| MessageParseError::SliceTooSmall)?;
         let magic = header
             .magic()
             .map_err(|Invalid(magic, _)| MessageParseError::InvalidMagic(magic))?;
@@ -769,13 +691,13 @@ impl<'a> MessageRef<'a> {
             }
         };
 
-        let bytes = match &this {
-            Self::RequestProtocolVersionInfo(v) => v.bytes(),
-            Self::ProtocolVersionInfo(v) => v.bytes(),
-            Self::RequestControllerInfo(v) => v.bytes(),
-            Self::ControllerInfo(v) => v.bytes(),
-            Self::RequestControllerData(v) => v.bytes(),
-            Self::ControllerData(v) => v.bytes(),
+        let bytes: &[u8] = match &this {
+            Self::RequestProtocolVersionInfo(v) => &v.bytes,
+            Self::ProtocolVersionInfo(v) => &v.bytes,
+            Self::RequestControllerInfo(v) => &v.bytes,
+            Self::ControllerInfo(v) => &v.bytes,
+            Self::RequestControllerData(v) => &v.bytes,
+            Self::ControllerData(v) => &v.bytes,
         };
         hasher.write(&bytes[0..8]);
         hasher.write(&[0u8; 4]);
@@ -792,7 +714,7 @@ impl<'a> MessageRef<'a> {
         Ok(this)
     }
 
-    pub fn header(&self) -> Header<Ref> {
+    pub fn header(&self) -> &Header {
         match self {
             Self::RequestProtocolVersionInfo(v) => v.header(),
             Self::ProtocolVersionInfo(v) => v.header(),
@@ -805,12 +727,12 @@ impl<'a> MessageRef<'a> {
 }
 
 pub enum MessageMut<'a> {
-    RequestProtocolVersionInfo(RequestProtocolVersionInfo<'a, Mut>),
-    ProtocolVersionInfo(ProtocolVersionInfo<'a, Mut>),
-    RequestControllerInfo(RequestControllerInfo<'a, Mut>),
-    ControllerInfo(ControllerInfo<'a, Mut>),
-    RequestControllerData(RequestControllerData<'a, Mut>),
-    ControllerData(ControllerData<'a, Mut>),
+    RequestProtocolVersionInfo(&'a mut RequestProtocolVersionInfo),
+    ProtocolVersionInfo(&'a mut ProtocolVersionInfo),
+    RequestControllerInfo(&'a mut RequestControllerInfo),
+    ControllerInfo(&'a mut ControllerInfo),
+    RequestControllerData(&'a mut RequestControllerData),
+    ControllerData(&'a mut ControllerData),
 }
 
 impl<'a> MessageMut<'a> {
@@ -866,13 +788,13 @@ impl<'a> MessageMut<'a> {
             }
         };
 
-        let bytes = match &this {
-            Self::RequestProtocolVersionInfo(v) => v.bytes(),
-            Self::ProtocolVersionInfo(v) => v.bytes(),
-            Self::RequestControllerInfo(v) => v.bytes(),
-            Self::ControllerInfo(v) => v.bytes(),
-            Self::RequestControllerData(v) => v.bytes(),
-            Self::ControllerData(v) => v.bytes(),
+        let bytes: &[u8] = match &this {
+            Self::RequestProtocolVersionInfo(v) => &v.bytes,
+            Self::ProtocolVersionInfo(v) => &v.bytes,
+            Self::RequestControllerInfo(v) => &v.bytes,
+            Self::ControllerInfo(v) => &v.bytes,
+            Self::RequestControllerData(v) => &v.bytes,
+            Self::ControllerData(v) => &v.bytes,
         };
         hasher.write(&bytes[0..8]);
         hasher.write(&[0u8; 4]);
@@ -889,7 +811,7 @@ impl<'a> MessageMut<'a> {
         Ok(this)
     }
 
-    pub fn header(&self) -> Header<Ref> {
+    pub fn header(&self) -> &Header {
         match self {
             Self::RequestProtocolVersionInfo(v) => v.header(),
             Self::ProtocolVersionInfo(v) => v.header(),
@@ -900,7 +822,7 @@ impl<'a> MessageMut<'a> {
         }
     }
 
-    pub fn header_mut(&mut self) -> Header<Mut> {
+    pub fn header_mut(&mut self) -> &mut Header {
         match self {
             Self::RequestProtocolVersionInfo(v) => v.header_mut(),
             Self::ProtocolVersionInfo(v) => v.header_mut(),
