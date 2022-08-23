@@ -243,7 +243,7 @@ sub_fields!(ProtocolVersionInfo,
 );
 
 enum_fields!(ProtocolVersionInfo,
-    protocol set_protocol from u16[(20 + 0)..2] Protocol = "protocol" {
+    protocol set_protocol from u16[(20 + 0)..22] Protocol = "protocol" {
         1001 => Protocol::Version1001,
     }
 );
